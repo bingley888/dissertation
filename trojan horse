@@ -1,0 +1,32 @@
+# data loading
+```{r}
+library(haven)
+library(tidyverse)
+library(scales)
+theme_set(theme_light())
+library(tidymodels)
+library(MatchIt)
+library(WeightIt)
+library(tidymodels)
+library(tableone)
+library(vip)
+library(finetune)
+library(patchwork)
+library(sandwich)
+library(lmtest)
+library(rsample)
+library(cobalt)
+
+
+setwd("C:/Users/wjdtk/OneDrive/Desktop/disertation/r")
+
+dataset <- read_dta("C:/Users/wjdtk/OneDrive/Desktop/disertation/dataset/PSM_Prep_all_Final.dta") %>%
+  as_tibble() %>%
+  mutate(thanaid = upzvill %/% 10) %>%
+  mutate(control_thana = thanaid <= 24) %>%
+  mutate(elig_defactopp1 = flopt < 50 | part1pp) %>%
+  mutate(lnconsweek_rvsd = log(consweekpc)) %>%
+  mutate(male = ifelse(sex == 1, 1, 0)) %>%
+  mutate(sumnonagri = wagenonag,
+         sumagri = wageag)
+```
