@@ -1,4 +1,6 @@
 # data loading
+
+## package loading
 ```{r}
 library(haven)
 library(tidyverse)
@@ -17,7 +19,9 @@ library(lmtest)
 library(rsample)
 library(cobalt)
 
-
+```
+## household level data managment
+```{r}
 setwd("C:/Users/wjdtk/OneDrive/Desktop/disertation/r")
 
 dataset <- read_dta("C:/Users/wjdtk/OneDrive/Desktop/disertation/dataset/PSM_Prep_all_Final.dta") %>%
@@ -120,3 +124,618 @@ dataset_hh <-
   rename(pct_participation = "pct_sum")
 ```
 
+# model implementation
+## machine learning models
+### logit model
+```{r}
+dataset_hh_logit <-
+  dataset_hh %>%
+  glm(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))), family = binomial(link = "logit"), data =.) 
+
+```
+ - Similarly with the STATA simulation
+
+#### randomforest
+```{r}
+library(smd)
+
+table <-
+  CreateTableOne(
+  data = dataset_hh %>% 
+    select(-thanaid, - rowid, - nh, -pct_participation),
+  factorVars = c("nonfarm"),
+  strata = "treat",
+  smd = TRUE)
+
+table <- print(table,
+      smd = T,
+      showAllLevels = T,
+      noSpaces = T,
+      printToggle = F,
+      pDigits  = 10)
+
+dataset_hh %>% 
+  select(-thanaid, - rowid, - nh, -pct_participation, -lnconsweek_rvsd, -labsupmenMD1, -lnnonlandwomen) %>%
+  summarize_at(.vars = vars(everything()),
+               .funs = list(smd = ~ smd(., g = treat)$estimate)) %>%
+  pivot_longer(ends_with("smd")) %>%
+  filter(name != "treat_smd")
+
+
+```
+
+### Randomforest estimation
+```{r}
+doParallel::registerDoParallel()
+
+
+set.seed(123)
+split_hh <- initial_split(dataset_hh, strata = treat)
+train_hh <- training(split_hh)
+test_hh <- testing(split_hh)
+
+set.seed(234)
+folds <- vfold_cv(train_hh, strata = treat, v = 10)
+
+
+rand_model <-
+  rand_forest(trees = tune(), mtry = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+rand_recipe <-
+  dataset_hh %>%
+  recipe(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + ")))) %>%
+  step_dummy(all_nominal_predictors(), one_hot = T)
+
+rand_wf <-
+  workflow() %>%
+  add_model(rand_model) %>%
+  add_recipe(rand_recipe)
+
+rand_tune <-
+  tune_race_anova(
+    rand_wf,
+    folds,
+    metrics = metric_set(mn_log_loss),
+    grid = crossing(trees = seq(100, 1000, 100), mtry = seq(3, 15, 3)),
+    control = control_race(verbose = T)
+  )
+
+rand_finalize <-
+  finalize_workflow(rand_wf,
+    select_best(rand_tune, "mn_log_loss")
+  )
+
+rand_last <-
+  rand_wf %>%
+  last_fit(split_hh, metrics = metric_set(mn_log_loss))
+
+rand_hh_fit <-
+  fit(rand_wf, dataset_hh)
+```
+
+### SVM estimation
+```{r}
+svm_model <-
+  svm_rbf(cost = tune(), 
+          rbf_sigma = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_recipe <-
+  dataset_hh %>%
+  recipe(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + ")))) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+svm_wf <-
+  workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(svm_recipe)
+
+svm_tune <-
+ tune_race_anova(
+    svm_wf,
+    folds,
+    metrics = metric_set(mn_log_loss),
+    grid = grid_regular(parameters(svm_model) %>%
+                          update(cost = cost(c(0,5)),
+                                 rbf_sigma = rbf_sigma(c(-2.5,0))), levels = 20),
+    control = control_race(verbose = T)
+  )
+
+svm_tune %>%
+  collect_metrics() %>%
+  mutate(cost = log2(cost),
+         rbf_sigma = log10(rbf_sigma)) %>%
+  pivot_longer(cost:rbf_sigma) %>%
+  ggplot(aes(value, mean)) +
+  geom_point() +
+  facet_wrap(~name, scale = "free")
+
+
+final_svm <-
+  finalize_workflow(svm_wf,
+    select_best(svm_tune, "mn_log_loss")
+  )
+
+svm_last <-
+  final_svm %>%
+  last_fit(split_hh, metrics = metric_set(mn_log_loss))
+
+svm_last %>% collect_metrics()
+
+svm_last %>%
+  extract_fit_parsnip() %>%
+  vip()
+
+svm_hh_fit <-
+  fit(svm_wf, dataset_hh)
+```
+
+### elastic
+```{r}
+elastic_model <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+# svm_recipe <-
+#  dataset_hh %>%
+#  recipe(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + ")))) %>%
+#  step_normalize(all_numeric_predictors()) %>%
+#  step_dummy(all_nominal_predictors())
+
+elastic_wf <-
+  workflow() %>%
+  add_model(elastic_model) %>%
+  add_recipe(svm_recipe)
+
+elastic_tune <-
+ tune_race_anova(
+    elastic_wf,
+    folds,
+    metrics = metric_set(mn_log_loss),
+    grid = grid_regular(parameters(elastic_model), levels = 10),
+    control = control_race(verbose = T)
+  )
+
+elastic_tune %>%
+  collect_metrics() %>%
+  pivot_longer(penalty:mixture) %>%
+  ggplot(aes(value, mean)) +
+  geom_point() +
+  facet_wrap(~name, scale = "free")
+
+
+final_elastic <-
+  finalize_workflow(elastic_wf,
+    select_best(elastic_tune, "mn_log_loss")
+  )
+
+elastic_last <-
+  elastic_wf %>%
+  last_fit(split_hh, metrics = metric_set(mn_log_loss))
+
+elastic_last %>% collect_metrics()
+
+elastic_last %>%
+  extract_fit_parsnip() %>%
+  vip()
+
+elastic_hh_fit <-
+  fit(elastic_wf, dataset_hh)
+```
+
+### xgboost
+```{r}
+xg_model <-
+  boost_tree(trees = tune(), 
+             mtry = tune(),
+             min_n = tune(),
+             sample_size = tune(),
+             tree_depth = tune(),
+             learn_rate = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+xg_recipe <-
+  dataset_hh %>%
+  recipe(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + ")))) %>%
+  step_dummy(all_nominal_predictors(), one_hot = T)
+
+xg_wf <-
+  workflow() %>%
+  add_model(xg_model) %>%
+  add_recipe(xg_recipe)
+
+xg_param <-
+  parameters(xg_model) %>%
+  update(mtry = mtry(c(1,15)))
+
+xg_tune1 <-
+  tune_bayes(
+    xg_wf,
+    folds,
+    iter = 1000,
+    initial = xg_tune,
+    metrics = metric_set(mn_log_loss),
+    param_info = xg_param,
+    control = control_bayes(verbose = T,
+                            no_improve = 30)
+  )
+
+xg_finalize <-
+  finalize_workflow(xg_wf,
+    select_best(xg_tune1, "mn_log_loss")
+  )
+
+xg_last <-
+  xg_wf %>%
+  last_fit(split_hh, metrics = metric_set(mn_log_loss))
+
+xg_last %>%
+  collect_metrics()
+
+xg_last %>%
+  extract_fit_parsnip() %>%
+  vip()
+
+xg_hh_fit <-
+  fit(xg_wf, dataset_hh)
+```
+
+## model metrics
+```{r}
+data_hh_fit_logit <- augment(dataset_hh_logit, dataset_hh, type.predict = "response") %>%
+  rename(.pred_1 = ".fitted")
+data_hh_fit_rand <- augment(rand_hh_fit, dataset_hh, type.predict = "response")
+data_svm_hh_fit <- augment(svm_hh_fit, dataset_hh, type.predict = "response")
+data_elastic_hh_fit <- augment(elastic_hh_fit, dataset_hh, type.predict = "response")
+data_xg_hh_fit <- augment(xg_hh_fit, dataset_hh, type.predict = "response")
+
+
+model_summary <-
+  function(tbl) {
+    tbl %>%
+      roc_auc(truth = treat,
+          estimate = .pred_1,
+          event_level = "second") %>%
+  bind_rows(
+    tbl %>%
+  mn_log_loss(truth = treat,
+          estimate = .pred_1,
+          event_level = "second"))
+  }
+
+summary_dataset <-
+  tibble(name = c("data_hh_fit_logit","data_hh_fit_rand", "data_svm_hh_fit", "data_elastic_hh_fit", "data_xg_hh_fit"),
+         data = list(data_hh_fit_logit, data_hh_fit_rand, data_svm_hh_fit, data_elastic_hh_fit, data_xg_hh_fit)) %>%
+  mutate(model_summary = map(data, model_summary)) %>%
+  unnest(model_summary) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(-.estimator) %>%
+  mutate(name = str_remove_all(name, "data|hh|fit|_"))
+
+summary_dataset
+  
+weight_summary <- function(tbl) {
+  weight <- tbl %>%
+    weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))), 
+             data = .,
+             ps = tbl$.pred_1,
+             stabilize = T,
+             #estimand = "ATT",
+             method = "ps")
+  
+  weight_blance <- weight %>%
+    bal.tab(m.threshold = .01, un = T) %>%
+    pluck(1) %>%
+    as_tibble(rownames = "NULL") %>%
+    rename(variable = 'NULL') %>%
+    select(variable, Diff.Adj) %>%
+    filter(variable != "prop.score")
+  
+  weight_blance
+    
+  }
+
+summary_dataset1 <- 
+  summary_dataset %>%
+  mutate(balance = map(data, weight_summary)) %>%
+  unnest(c(balance)) %>%
+  group_by(name) %>%
+  summarize(n = n(),
+            sum= sum(Diff.Adj < 0.05),
+            pct = sum/n,
+            mean_SMD = mean(Diff.Adj)) %>%
+  select(-n)
+
+
+min_max_summary <-
+  function(tbl) {
+    min_max <- tbl %>%
+      group_by(treat) %>%
+      summarize(max = max(.pred_1),
+                min = min(.pred_1)) %>%
+      pivot_wider(names_from = treat, values_from = c(max, min)) %>%
+      mutate(max = min(max_0, max_1),
+             min = max(min_0, min_1)) %>%
+      select(min, max)
+    
+    tbl %>%
+      summarize(n = n(),
+                count = sum(between(.pred_1, min_max$min, min_max$max)),
+                pct_count = count/n) %>%
+      select(-n)
+  }
+
+summary_iptw <-
+  function(tbl) {
+    tbl %>%
+      rename(propensity = .pred_1) %>%
+      mutate(treat = ifelse(treat == 1, 1, 0)) %>%
+      mutate(ipw = (treat / propensity) + ((1 - treat) / (1 - propensity)),
+             ipw_stabilized = ifelse(treat ==0, 0.551*ipw, (1-0.551)*ipw) ) %>% 
+      lm(lnconsweek_rvsd ~ treat, weights = ipw_stabilized, data = .) %>%
+      coeftest(vcov = vcovCL, cluster = ~thanaid) %>%
+      tidy() %>%
+      filter(term == "treat") %>%
+      select(-term)
+  }
+
+lm_est <- function(split, ...) {
+  lm(lnconsweek_rvsd ~ treat, weights = ipw_stabilized, data = analysis(split)) %>%
+    coeftest(vcov = vcovCL, cluster = ~thanaid) %>%
+    tidy()
+}
+
+
+
+model_boostraps <-
+  function(tbl) {
+    set.seed(2022)
+    boot <-
+      tbl %>%
+      rename(propensity = .pred_1) %>%
+      mutate(treat = ifelse(treat == 1, 1, 0)) %>%
+      mutate(ipw = (treat / propensity) + ((1 - treat) / (1 - propensity)),
+             ipw_stabilized = ifelse(treat ==0, 0.551*ipw, (1-0.551)*ipw)) %>%
+      bootstraps(times = 1000) %>%
+      mutate(results = map(splits, lm_est))
+    
+    output <-
+      int_pctl(boot, results, alpha = .5) %>%
+      filter(term == "treat") %>%
+      select(-.method, -.alpha)
+    
+    output
+  }
+
+summary_final <-
+  summary_dataset %>%
+  inner_join(summary_dataset1, by ="name") %>%
+  mutate(positivity = map(data, min_max_summary)) %>%
+  mutate(iptw_estimation = map(data, summary_iptw)) %>%
+  mutate(iptw_boot = map(data, model_boostraps))
+
+
+summary_final
+
+
+summary_final1 <-
+  summary_final %>%
+  unnest(c(iptw_boot, iptw_estimation, positivity)) %>%
+  select(-data)
+
+## variable importance
+```{r}
+name_formal
+
+
+p1 <- dataset_hh_logit %>% 
+  tidy() %>% 
+  arrange(-abs(estimate)) %>%
+  inner_join(name_formal, by = c(term = "variable")) %>%
+#  mutate(formal_name = fct_reorder(formal_name, abs(estimate))) %>%
+  mutate(postive = ifelse(estimate <0, "Negative", "Positive")) %>%
+  ggplot(aes(abs(estimate), formal_name, fill = postive)) +
+  geom_col() +
+ # geom_vline(xintercept = 0, color = "grey50", size = 1.3, lty = 2) +
+  labs(x = "Coefficients", 
+       y = "",
+       fill = "") +
+  scale_fill_grey() +
+  scale_x_reverse(expand = c(0,0)) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.y.left = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x.bottom = element_text(size = 14))
+
+p1
+
+
+p2 <- rand_hh_fit %>%
+  extract_fit_parsnip() %>%
+  vip() +
+  theme(axis.title.x = element_text(size = 15),
+        axis.text.y.left = element_text(size = 14),
+        axis.text.x.bottom = element_text(size = 14))
+
+p2 <-kkk$data %>%
+  mutate(Variable = ifelse(Variable == "nonfarm_X1", "nonfarm", Variable)) %>%
+  inner_join(name_formal, by = c(Variable = "variable")) %>%
+#  mutate(formal_name = fct_reorder(formal_name, Importance)) %>%
+  ggplot(aes(Importance, formal_name)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0,0)) +
+  labs( y = "",
+        x = "Importance") +
+  theme(axis.title.x = element_text(size = 15),
+        axis.text.y.left = element_text(size = 14),
+        axis.text.y = element_text(hjust = .5),
+        axis.ticks.y = element_blank(),
+        axis.text.x.bottom = element_text(size = 14))
+ 
+
+
+p1 + p2
+```
+
+
+
+
+```{r}
+weight_logit <-
+  dataset_hh %>%
+  weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))), 
+          data = .,
+          stabilize = T,
+          #estimand = "ATT",
+          method = "ps")
+
+weightit_logit_balance <-
+  weight_logit %>%
+  bal.tab(m.threshold = .01, un = T)
+
+
+
+
+balance_logit <-
+  weightit_logit_balance$Balance %>%
+  as_tibble(rownames = "NULL") %>%
+  rename(logit = "Diff.Adj",
+         variable = "NULL") %>%
+  select(variable, logit)
+  
+  
+weight_rs <-
+  dataset_hh %>%
+  weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))), 
+          data = .,
+          ps = data_hh_fit_rand$.pred_1,
+          stabilize = T,
+          method = "ps")
+
+weight_rs %>% summary
+
+weightit_rs_balance <- weight_rs %>%
+  bal.tab(m.threshold = .01, un = T)
+
+
+weight_svm <-
+    dataset_hh %>%
+  weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))),           data = .,
+          ps = data_svm_hh_fit$.pred_1,
+          stabilize = T,
+          method = "ps")
+
+weightit_svm_balance <- weight_svm %>%
+  bal.tab(m.threshold = .01, un = T)
+
+balance_svm <-
+  weightit_svm_balance$Balance %>%
+  as_tibble(rownames = "NULL") %>%
+  rename(svm = "Diff.Adj",
+         variable = "NULL") %>%
+  select(variable, svm)
+
+
+weight_elastic <-
+    dataset_hh %>%
+  weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))),           data = .,
+          ps = data_elastic_hh_fit$.pred_1,
+          stabilize = T,
+          method = "ps")
+
+weightit_elastic_balance <- weight_elastic %>%
+  bal.tab(m.threshold = .01, un = T)
+
+balance_elastic <-
+  weightit_elastic_balance$Balance %>%
+  as_tibble(rownames = "NULL") %>%
+  rename(elastic= "Diff.Adj",
+         variable = "NULL") %>%
+  select(variable, elastic)
+
+
+weight_xg <-
+    dataset_hh %>%
+  weightit(as.formula(paste("treat~", paste(chemin3_hh_formula, collapse =  " + "))),           data = .,
+          ps = data_xg_hh_fit$.pred_1,
+          stabilize = T,
+          method = "ps")
+
+weightit_xg_balance <- weight_xg %>%
+  bal.tab(m.threshold = .01, un = T)
+
+balance_xg<-
+  weightit_xg_balance$Balance %>%
+  as_tibble(rownames = "NULL") %>%
+  rename(xg = "Diff.Adj",
+         variable = "NULL") %>%
+  select(variable, xg)
+
+
+balance_total <-
+  weightit_rs_balance$Balance %>%
+  as_tibble(rownames = "NULL") %>%
+  rename(rand = "Diff.Adj",
+         variable = "NULL") %>%
+  inner_join(balance_logit, by = "variable") %>%
+  inner_join(balance_elastic, by = "variable") %>%
+  inner_join(balance_xg, by = "variable") %>%
+  inner_join(balance_svm, by = "variable") %>%
+  select(-starts_with("m"), -Type) %>%
+  filter(variable != "prop.score") %>%
+  mutate_if(is.numeric, ~abs(.)) 
+
+
+
+```
+
+
+## Common support (fig 3)
+```{r}
+data_hh_fit_rand %>%
+  inner_join(data_hh_fit_logit %>% select(rowid, .fitted = .pred_1)) %>%
+  select(rowid,treat, logistic = .fitted, randomforest = .pred_1) %>%
+  pivot_longer(logistic:randomforest) %>%
+  mutate(participation = ifelse(treat == 1, "yes", "no")) %>%
+  mutate(name = str_to_title(name)) %>%
+  ggplot(aes(value)) +
+  geom_density(aes(fill = participation), alpha = .7) +
+  facet_wrap(~ name, nrow = 1, scales = "free_y") +
+  labs(fill = "Participation") +
+  scale_fill_grey() +
+  labs(y = "",
+       x = "") +
+  theme(legend.position = "bottom",
+        strip.text = element_text(size = 15)) 
+
+min_max_summary <-
+  function(tbl) {
+    tbl %>%
+      group_by(treat) %>%
+      summarize(max = max(.pred_1),
+                min = min(.pred_1)) %>%
+      pivot_wider(names_from = treat, values_from = c(max, min)) %>%
+      mutate(max = min(max_0, max_1),
+             min = max(min_0, min_1)) %>%
+      select(min, max)
+    
+    tbl %>%
+      summarize(n = n(),
+                count = sum(between(.pred_1, min_max_logit$min, min_max_logit$max)),
+                pct_count = count/n) %>%
+      select(-n)
+  }
+ 
+
+
+```
