@@ -30,3 +30,93 @@ dataset <- read_dta("C:/Users/wjdtk/OneDrive/Desktop/disertation/dataset/PSM_Pre
   mutate(sumnonagri = wagenonag,
          sumagri = wageag)
 ```
+
+## household level data managment
+```{r}
+chemin3_formula <-
+  str_split("male agey agehhhh no_of_adultmales maxed cssv nonfarm livestockvalue hhsize sumnonagri sumagri agesq age4 thanaid", pattern = " ") %>% 
+  pluck(1)
+
+
+chemin3_hh_formula <-
+  str_split("agehhhh no_of_adultmales maxed cssv nonfarm livestockvalue hhsize sumnonagri sumagri median_age age_sq", pattern = " ") %>% 
+  pluck(1)
+
+
+household_participated_pct <-
+  dataset %>%
+  filter(control_thana == 1) %>%
+  group_by(nh) %>%
+  summarize(n = n(),
+            sum = sum(elig_defacto_treatpp == 1),
+            pct_sum = sum/n) %>%
+  arrange(-pct_sum) %>%
+  select(nh, pct_sum)
+
+
+household_participated <-
+  dataset %>%
+  filter(control_thana == 1) %>%
+  group_by(nh) %>%
+  summarize(n = n(),
+            sum = sum(elig_defacto_treatpp == 1),
+            pct_sum = sum/n) %>%
+  filter(pct_sum == 0) %>%
+  pull(nh)
+
+household_mismatch <-
+  dataset %>%
+  mutate(rowid = row_number()) %>%
+  filter(control_thana == 1) %>%
+  select(rowid, nh, chemin3_formula, lnconsweek_rvsd) %>%
+  mutate(treat = ifelse(nh %in% household_participated, 1, 0)) %>%
+  mutate(agehhh_round = floor(agehhhh)) %>%
+  filter(agehhh_round == agey) %>%
+  distinct(nh) %>%
+  pull(nh)
+
+dataset %>%
+  mutate(rowid = row_number()) %>%
+  filter(control_thana == 1) %>%
+  select(rowid, nh, chemin3_formula, lnconsweek_rvsd) %>%
+  mutate(treat = ifelse(nh %in% household_participated, 1, 0)) %>%
+  mutate(agehhh_round = floor(agehhhh)) %>%
+  filter(agehhh_round != agey) %>%
+  filter(!nh %in% household_mismatch) %>% count(nh)
+  
+dataset %>%
+  mutate(rowid = row_number()) %>%
+  filter(control_thana == 1) %>%
+  select(rowid, nh, chemin3_formula, lnconsweek_rvsd) %>%
+  mutate(treat = ifelse(nh %in% household_participated, 1, 0)) %>%
+  filter(agey == floor(agehhhh) | agey == floor(agehhhh - 1)) %>% # agehhh 가 잘못기입된 경우가 있었음
+  add_count(nh) %>%
+  filter(!rowid %in% c(757, 3492, 3745, 4926, 6856, 6893, 7233 )) %>%
+  filter(n == 2)
+
+median_age <- 
+  dataset %>%
+  mutate(rowid = row_number()) %>%
+  filter(control_thana == 1) %>%
+  group_by(nh) %>%
+  summarize(median_age = median(agey, na.rm = T))
+
+dataset_hh <-
+  dataset %>%
+  mutate(rowid = row_number()) %>%
+  filter(control_thana == 1) %>%
+  select(rowid, nh, chemin3_formula, lnconsweek_rvsd, lnnonlandwomen, labsupmenMD1) %>%
+  mutate(treat = ifelse(nh %in% household_participated, 1, 0)) %>%
+  filter(agey == floor(agehhhh) | agey == floor(agehhhh - 1)) %>% # agehhh 가 잘못기입된 경우가 있었음
+  add_count(nh) %>%
+  filter(!rowid %in% c(757, 3492, 3745, 4926, 6856, 6893, 7233)) %>% # 7233 might be duplicated
+  select(-male, -agey, -agesq, -age4, -agesq, -n) %>%
+  inner_join(household_participated_pct, by = "nh") %>%
+  inner_join(median_age, by = "nh") %>%
+  mutate(thanaid = factor(thanaid),
+         treat = factor(treat),
+         nonfarm = factor(nonfarm),
+         age_sq = median_age^2) %>%
+  rename(pct_participation = "pct_sum")
+```
+
